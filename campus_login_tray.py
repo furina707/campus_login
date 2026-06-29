@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-校园网自动登录 - 系统托盘版 v9.0 (ctypes 直接调用)
-零 gi 依赖，任何 Python 版本都能运行
+校园网自动登录 - 系统托盘版 v10.0 (零第三方依赖)
+仅使用 Python 标准库 + 系统共享库 (ctypes)
 """
 
 import sys
@@ -12,14 +12,11 @@ import urllib.request
 import urllib.parse
 import subprocess
 import re
+import struct
+import zlib
 import ctypes
 from datetime import datetime
 from typing import Optional, Callable
-from io import BytesIO
-
-import numpy as np
-import onnxruntime
-from PIL import Image
 
 # ==================== ctypes 加载 GTK/AppIndicator ====================
 
@@ -158,7 +155,238 @@ RETRY_INTERVAL = 5
 
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
-# ==================== ddddocr 核心代码 ====================
+# ==================== 纯 Python PNG 解码器 ====================
+
+def _png_decode(data: bytes):
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError("Not a PNG file")
+    
+    pos = 8
+    chunks = {}
+    idat_data = b''
+    
+    while pos < len(data):
+        length = struct.unpack('>I', data[pos:pos+4])[0]
+        chunk_type = data[pos+4:pos+8]
+        chunk_data = data[pos+8:pos+8+length]
+        crc = struct.unpack('>I', data[pos+8+length:pos+12+length])[0]
+        
+        if chunk_type == b'IHDR':
+            chunks['IHDR'] = struct.unpack('>IIBBBBB', chunk_data)
+        elif chunk_type == b'IDAT':
+            idat_data += chunk_data
+        elif chunk_type == b'IEND':
+            break
+        
+        pos += 12 + length
+    
+    width, height, bit_depth, color_type = chunks['IHDR'][:4]
+    
+    raw = zlib.decompress(idat_data)
+    
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type, 1)
+    stride = width * channels * (bit_depth // 8)
+    
+    pixels = []
+    scanline = stride + 1
+    prev_row = bytearray(stride)
+    
+    for y in range(height):
+        start = y * scanline + 1
+        filt = raw[start - 1]
+        row = bytearray(raw[start:start + stride])
+        
+        if filt == 0:
+            pass
+        elif filt == 1:
+            for i in range(len(row)):
+                a = row[i - channels] if i >= channels else 0
+                row[i] = (row[i] + a) & 0xFF
+        elif filt == 2:
+            for i in range(len(row)):
+                b = prev_row[i]
+                row[i] = (row[i] + b) & 0xFF
+        elif filt == 3:
+            for i in range(len(row)):
+                a = row[i - channels] if i >= channels else 0
+                b = prev_row[i]
+                row[i] = (row[i] + ((a + b) >> 1)) & 0xFF
+        elif filt == 4:
+            for i in range(len(row)):
+                a = row[i - channels] if i >= channels else 0
+                b = prev_row[i]
+                c = prev_row[i - channels] if i >= channels else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                if pa <= pb and pa <= pc:
+                    pr = a
+                elif pb <= pc:
+                    pr = b
+                else:
+                    pr = c
+                row[i] = (row[i] + pr) & 0xFF
+        
+        pixels.append(list(row))
+        prev_row = row
+    
+    gray = []
+    for row in pixels:
+        if color_type == 0:
+            gray.append(row[:])
+        elif color_type == 2:
+            gray.append([row[i*3] for i in range(width)])
+        elif color_type == 4:
+            gray.append([row[i*2] for i in range(width)])
+        elif color_type == 6:
+            gray.append([row[i*4] for i in range(width)])
+    
+    return gray, width, height
+
+
+def _resize_bilinear(img, new_w, new_h):
+    old_w = len(img[0])
+    old_h = len(img)
+    result = []
+    for y in range(new_h):
+        src_y = (y + 0.5) * old_h / new_h - 0.5
+        y0 = int(src_y)
+        y1 = min(y0 + 1, old_h - 1)
+        fy = src_y - y0
+        row = []
+        for x in range(new_w):
+            src_x = (x + 0.5) * old_w / new_w - 0.5
+            x0 = int(src_x)
+            x1 = min(x0 + 1, old_w - 1)
+            fx = src_x - x0
+            val = (img[y0][x0] * (1-fx) * (1-fy) +
+                   img[y0][x1] * fx * (1-fy) +
+                   img[y1][x0] * (1-fx) * fy +
+                   img[y1][x1] * fx * fy)
+            row.append(val)
+        result.append(row)
+    return result
+
+
+def _argmax_2d(matrix):
+    max_val = matrix[0][0]
+    max_i, max_j = 0, 0
+    for i, row in enumerate(matrix):
+        for j, val in enumerate(row):
+            if val > max_val:
+                max_val = val
+                max_i, max_j = i, j
+    return max_i, max_j
+
+
+def _argmax_1d(arr):
+    max_val = arr[0]
+    max_idx = 0
+    for i, val in enumerate(arr):
+        if val > max_val:
+            max_val = val
+            max_idx = i
+    return max_idx
+
+
+# ==================== ctypes ONNX Runtime ====================
+
+HAS_ONNX = False
+_ort = None
+
+try:
+    _ort = ctypes.CDLL("libonnxruntime.so.1")
+    HAS_ONNX = True
+except OSError:
+    try:
+        _ort = ctypes.CDLL("libonnxruntime.so")
+        HAS_ONNX = True
+    except OSError:
+        HAS_ONNX = False
+
+
+class OrtSession:
+    def __init__(self, model_path: str):
+        if not HAS_ONNX:
+            raise RuntimeError("libonnxruntime not found")
+        
+        self.session_ptr = ctypes.c_void_p()
+        
+        _ort.CreateSession.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+        _ort.CreateSession.restype = ctypes.c_int
+        status = _ort.CreateSession(model_path.encode('utf-8'), ctypes.byref(self.session_ptr), None)
+        if status != 0:
+            raise RuntimeError(f"CreateSession failed: {status}")
+        
+        self.input_names = ['input']
+        self.input_shape = [1, 1, 64, -1]
+
+    def run(self, input_data):
+        input_flat = []
+        for row in input_data[0][0]:
+            input_flat.extend(row)
+        
+        n = len(input_flat)
+        FloatArray = ctypes.c_float * n
+        arr = FloatArray(*input_flat)
+        
+        shape = [1, 1, len(input_data[0][0]), len(input_data[0][0][0])]
+        Int64Array = ctypes.c_int64 * 4
+        shape_arr = Int64Array(*shape)
+
+        ort_input = ctypes.Structure
+        ort_input._fields_ = [
+            ('name', ctypes.c_char_p),
+            ('data_type', ctypes.c_int),
+            ('dimensions', ctypes.c_int),
+            ('shape', ctypes.POINTER(ctypes.c_int64)),
+            ('data', ctypes.c_void_p),
+        ]
+        
+        inp = ort_input()
+        inp.name = b'input'
+        inp.data_type = 1
+        inp.dimensions = 4
+        inp.shape = shape_arr
+        inp.data = ctypes.cast(arr, ctypes.c_void_p)
+        
+        inputs_arr = (ctypes.POINTER(type(ort_input)) * 1)(ctypes.pointer(inp))
+        
+        output_ptr = ctypes.c_void_p()
+        outputs = (ctypes.POINTER(ctypes.c_void_p) * 1)(ctypes.byref(output_ptr))
+        
+        _ort.Run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        _ort.Run.restype = ctypes.c_int
+        
+        status = _ort.Run(
+            self.session_ptr, None,
+            inputs_arr, 1,
+            outputs, None, 1,
+            None
+        )
+        if status != 0:
+            raise RuntimeError(f"Run failed: {status}")
+        
+        raw_output = ctypes.cast(output_ptr, ctypes.POINTER(ctypes.c_float))
+        seq_len = 66
+        class_count = 11
+        result = [[0.0] * class_count for _ in range(seq_len)]
+        for t in range(seq_len):
+            for c in range(class_count):
+                result[t][c] = raw_output[t * class_count + c]
+        
+        return [result]
+
+
+# ==================== ddddocr 核心代码 (纯标准库) ====================
 
 def load_charset(charset_path: str) -> list:
     charset = []
@@ -176,67 +404,41 @@ def load_charset(charset_path: str) -> list:
 
 DEFAULT_CHARSET = load_charset(CHARSET_PATH)
 
+
 class DdddOcr:
     def __init__(self):
-        onnxruntime.set_default_logger_severity(3)
         model_path = os.path.join(MODEL_DIR, 'common_old.onnx')
-        
-        try:
-            providers = [
-                ('CUDAExecutionProvider', {'device_id': 0}),
-                'CPUExecutionProvider'
-            ]
-        except Exception:
-            providers = ['CPUExecutionProvider']
-        
-        self.session = onnxruntime.InferenceSession(model_path, providers=providers)
+        self.session = OrtSession(model_path)
         self.charset = DEFAULT_CHARSET
     
-    def _preprocess_image(self, image: Image.Image) -> np.ndarray:
-        if image.mode != 'L':
-            image = image.convert('L')
+    def _preprocess_image(self, img_bytes: bytes):
+        pixels, width, height = _png_decode(img_bytes)
         
         target_height = 64
-        original_width, original_height = image.size
-        target_width = int(original_width * (target_height / original_height))
-        image = image.resize((target_width, target_height), Image.LANCZOS)
+        target_width = int(width * (target_height / height))
         
-        img_array = np.array(image).astype(np.float32) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array = np.expand_dims(img_array, axis=0)
+        resized = _resize_bilinear(pixels, target_width, target_height)
         
-        return img_array
+        normalized = [[v / 255.0 for v in row] for row in resized]
+        
+        return [[[normalized]]]
     
-    def _ctc_decode(self, predicted_indices: np.ndarray) -> list:
+    def _ctc_decode(self, predicted_indices: list) -> list:
         decoded_indices = []
         prev_idx = None
-        
         for idx in predicted_indices:
-            idx = int(idx)
             if idx != prev_idx and idx != 0:
                 decoded_indices.append(idx)
             prev_idx = idx
-        
         return decoded_indices
     
     def classification(self, img_content: bytes) -> str:
-        image = Image.open(BytesIO(img_content))
-        processed_image = self._preprocess_image(image)
+        processed_image = self._preprocess_image(img_content)
         
-        input_name = self.session.get_inputs()[0].name
-        outputs = self.session.run(None, {input_name: processed_image})
-        
+        outputs = self.session.run(processed_image)
         output = outputs[0]
         
-        if len(output.shape) == 3:
-            if output.shape[1] == 1:
-                predicted_indices = np.argmax(output[:, 0, :], axis=1)
-            else:
-                predicted_indices = np.argmax(output[0, :, :], axis=1)
-        else:
-            predicted_indices = np.argmax(output, axis=-1)
-            if predicted_indices.ndim == 0:
-                predicted_indices = np.array([predicted_indices])
+        predicted_indices = [_argmax_1d(timestep) for timestep in output]
         
         decoded_indices = self._ctc_decode(predicted_indices)
         result = ''.join([self.charset[idx] for idx in decoded_indices 
