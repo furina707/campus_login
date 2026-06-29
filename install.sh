@@ -50,13 +50,13 @@ echo "[3/4] 安装系统依赖..."
 if command -v pacman &>/dev/null; then
     echo "    [*] 检测到 Arch Linux，使用 pacman 安装..."
     sudo pacman -S --needed --noconfirm \
-        gtk3 libappindicator-gtk3 onnx-runtime 2>/dev/null || {
+        gtk3 libappindicator-gtk3 onnxruntime-cpu 2>/dev/null || {
         echo "    [!] 部分包安装失败，请手动安装:"
-        echo "        sudo pacman -S gtk3 libappindicator-gtk3 onnx-runtime"
+        echo "        sudo pacman -S gtk3 libappindicator-gtk3 onnxruntime-cpu"
     }
     ldconfig -p | grep -q 'libonnxruntime' && \
         echo "    [OK] ONNX Runtime 已就绪" || \
-        echo "    [!] 未找到 libonnxruntime，请确认 onnx-runtime 已正确安装"
+        echo "    [!] 未找到 libonnxruntime，请确认 onnxruntime-cpu 已正确安装"
 else
     echo "    [!] 非 Arch 系统，请手动安装以下系统库:"
     echo "        GTK3, libappindicator3, ONNX Runtime"
